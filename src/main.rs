@@ -3,10 +3,13 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use dotenvy::dotenv;
+use std::env;
 
 fn main() {
+    dotenv().ok();
     // 服务端地址与端口
-    let address = "0.0.0.0:8080";
+    let address = &env::var("SERVER_ADDRESS").expect("SERVER_ADDRESS 未设置");
 
     // 启动监听器
     let listener = TcpListener::bind(address).expect("无法绑定到指定端口");

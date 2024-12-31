@@ -1,11 +1,11 @@
 // src/main.rs
 mod db;
-mod models;
 mod protocol;
-mod handlers;
+mod api;
 mod utils;
-mod client; // 新增模块
+mod client;
 
+use api::Api;
 use tokio::net::TcpListener;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -25,22 +25,22 @@ async fn main() -> Result<()> {
 
     // 共享状态，存储已登录的用户
     // HashMap 的键为 user_id，值为 Arc<Mutex<Client>>
-    let clients: Arc<Mutex<HashMap<String, Arc<Mutex<Client>>>>> = Arc::new(Mutex::new(HashMap::new()));
+    let clients: HashMap<String, Arc<Mutex<Client>>> = HashMap::new();
+
+    let api: Arc<Mutex<Api>> = Arc::new(Mutex::new(Api::new(pool,clients)));
 
     loop {
-        let (socket, addr) = listener.accept().await?;
-        println!("新连接来自: {}", addr);
+        if let Ok((socket, _)) = listener.accept().await {
+            let api_clone = Arc::clone(&api);
 
-        let pool = pool.clone();
-        let clients = clients.clone();
-
-        tokio::spawn(async move {
-            // 创建一个新的客户端实例
-            let client_arc = Client::new(socket);
-            // 处理客户端请求
-            if let Err(e) = Client::handle(client_arc.clone(), pool, clients).await {
-                println!("处理客户端时出错: {:?}", e);
-            }
-        });
+            // 处理每个客户端连接
+            tokio::spawn(async move {
+                let mut client = Client::new(socket, api_clone);
+                if let Err(e) = client.run().await {
+                    eprintln!("客户端断开连接: {:?}", e);
+                }
+            });
+            
+        }
     }
 }

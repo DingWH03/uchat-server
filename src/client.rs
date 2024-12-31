@@ -1,141 +1,172 @@
 // src/client.rs
 use tokio::net::TcpStream;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc};
 use std::collections::HashMap;
 use anyhow::Result;
-use sqlx::MySqlPool;
 use crate::protocol::{ClientRequest, ServerResponse};
-use crate::utils::{read_packet, send_packet};
-use crate::handlers::handle_authenticated_client;
-use bcrypt::{hash, verify};
+use crate::utils::{reader_packet, writer_packet};
+use crate::api::Api;
 
 #[derive(Clone)]
 pub struct Client {
-    pub socket: Arc<Mutex<TcpStream>>,
-    pub username: Option<String>,
-    pub user_id: Option<String>,
+    api: Arc<Mutex<Api>>,
+    user_id: String,
+    writer: Arc<Mutex<tokio::io::BufWriter<tokio::net::tcp::OwnedWriteHalf>>>,
+    reader: Arc<Mutex<tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>>>,
+    signed_in: bool,
 }
 
 impl Client {
-    /// 创建一个新的客户端实例，并将其包装在 `Arc<Mutex<>>` 中以实现线程安全的共享。
-    pub fn new(socket: TcpStream) -> Arc<Mutex<Self>> {
-        Arc::new(Mutex::new(Client {
-            socket: Arc::new(Mutex::new(socket)),
-            username: None,
-            user_id: None,
-        }))
+    pub fn new(
+        socket: TcpStream,
+        api: Arc<Mutex<Api>>,
+    ) -> Self {
+        let (reader, writer) = socket.into_split();
+        Self {
+            api,
+            user_id: String::new(),
+            writer: Arc::new(Mutex::new(tokio::io::BufWriter::new(writer))),
+            reader: Arc::new(Mutex::new(tokio::io::BufReader::new(reader))),
+            signed_in: false,
+        }
+    }
+    pub fn user_id(&self) -> String {
+        self.user_id.clone()
+    }
+    pub async fn send_packet(&mut self, msg: &ServerResponse) -> Result<()> {
+        writer_packet(&mut self.writer, &msg).await
+    }
+    pub async fn recv_packet(&mut self) -> Result<ClientRequest> {
+        reader_packet(&mut self.reader).await
+    }
+    async fn handle_register(&self, username: String, password: String) -> ServerResponse {
+        let status = {
+            let mut api = self.api.lock().await;
+            api.register(&username, &password).await
+        };
+    
+        match status {
+            Ok(true) => ServerResponse::AuthResponse {
+                status: "ok".to_string(),
+                message: "注册成功".to_string(),
+            },
+            Ok(false) => ServerResponse::AuthResponse {
+                status: "error".to_string(),
+                message: "用户名已存在".to_string(),
+            },
+            Err(err) => {
+                eprintln!("注册失败: {:?}", err);
+                ServerResponse::AuthResponse {
+                    status: "error".to_string(),
+                    message: "注册失败，请稍后重试".to_string(),
+                }
+            }
+        }
+    }
+    
+
+    async fn handle_login(&mut self, username: String, password: String) -> ServerResponse {
+        let status = {
+            let mut api = self.api.lock().await;
+            api.login(&username, &password, Arc::new(Mutex::new(self.clone()))).await
+        };
+    
+        match status {
+            Ok(true) => {
+                // 登录成功，更新用户状态
+                self.user_id = username.clone();
+                self.signed_in = true;
+    
+                ServerResponse::AuthResponse {
+                    status: "success".to_string(),
+                    message: "登录成功".to_string(),
+                }
+            }
+            Ok(false) => ServerResponse::AuthResponse {
+                status: "error".to_string(),
+                message: "用户名或密码错误".to_string(),
+            },
+            Err(err) => {
+                eprintln!("登录失败: {:?}", err);
+                ServerResponse::AuthResponse {
+                    status: "error".to_string(),
+                    message: "登录失败，请稍后重试".to_string(),
+                }
+            }
+        }
+    }
+    
+
+    async fn handle_send_message(
+        &self,
+        sender: String,
+        receiver: String,
+        message: String,
+    ) -> ServerResponse {
+        let status = {
+            let mut api = self.api.lock().await;
+            api.send_message(&sender, &receiver, &message).await
+        };
+
+        ServerResponse::AuthResponse {
+            status: if status { "ok".to_string() } else { "error".to_string() },
+            message: if status { "消息发送成功".to_string() } else { "用户不存在".to_string() },
+        }
     }
 
-    /// 处理客户端的注册和登录请求。
-    pub async fn handle(
-        client_arc: Arc<Mutex<Client>>,
-        pool: MySqlPool,
-        clients: Arc<Mutex<HashMap<String, Arc<Mutex<Client>>>>>,
-    ) -> Result<()> {
-        // 锁定客户端以进行操作
-        let mut client = client_arc.lock().await;
-
-        // 读取客户端的请求包
-        let request_json = match read_packet(&mut *client.socket.lock().await).await {
-            Ok(json) => json,
-            Err(_) => {
-                // 无法读取请求，关闭连接
-                return Ok(());
-            }
-        };
-
-        // 解析客户端请求
-        let request: ClientRequest = match serde_json::from_value(request_json) {
-            Ok(req) => req,
-            Err(_) => {
-                let response = ServerResponse::Error {
-                    message: "无效的请求格式".to_string(),
-                };
-                send_packet(&mut *client.socket.lock().await, &serde_json::to_value(response)?) .await?;
-                return Ok(());
-            }
-        };
-
-        match request {
-            ClientRequest::Register { username, password } => {
-                // 处理注册请求
-                let hashed = hash(&password, 4)?;
-                let res = sqlx::query("INSERT INTO users (username, password_hash) VALUES (?, ?)")
-                    .bind(&username)
-                    .bind(&hashed)
-                    .execute(&pool).await;
-
-                match res {
-                    Ok(_) => {
-                        let response = ServerResponse::AuthResponse {
-                            status: "ok".to_string(),
-                            message: "注册成功".to_string(),
-                        };
-                        send_packet(&mut *client.socket.lock().await, &serde_json::to_value(response)?).await?;
-                    },
-                    Err(e) => {
-                        let response = ServerResponse::Error {
-                            message: format!("注册失败: {}", e),
-                        };
-                        send_packet(&mut *client.socket.lock().await, &serde_json::to_value(response)?).await?;
-                        return Ok(());
-                    }
+    pub async fn run(&mut self) -> Result<()> {
+        loop {
+            let request = match self.recv_packet().await {
+                Ok(req) => req,
+                Err(e) => {
+                    // 检测到连接断开
+                    eprintln!("客户端连接断开，错误: {:?}", e);
+                    // 调用 Api.down 方法处理账号下线逻辑
+                    let mut api = self.api.lock().await;
+                    api.down(&self.user_id).await;
+                    break; // 跳出循环，停止处理客户端
                 }
-                return Ok(());
-            },
-            ClientRequest::Login { username, password } => {
-                // 处理登录请求
-                let row = sqlx::query!("SELECT id, password_hash FROM users WHERE username = ?", username)
-                    .fetch_optional(&pool).await?;
+            };
 
-                if let Some(user) = row {
-                    if verify(&password, &user.password_hash)? {
-                        client.user_id = Some(user.id.to_string());
-                        client.username = Some(username.clone());
-
-                        let response = ServerResponse::AuthResponse {
-                            status: "success".to_string(),
-                            message: "登录成功".to_string(),
-                        };
-                        send_packet(&mut *client.socket.lock().await, &serde_json::to_value(response)?).await?;
-
-                        // 将用户加入在线列表
-                        if let Some(ref user_id) = client.user_id {
-                            clients.lock().await.insert(user_id.clone(), Arc::clone(&client_arc));
-                            println!("用户 {} 已登录", username);
+            let response = match request {
+                ClientRequest::Register { username, password } => {
+                    self.handle_register(username, password).await
+                }
+                ClientRequest::Login { username, password } => {
+                    self.handle_login(username, password).await
+                }
+                ClientRequest::SendMessage { receiver, message } => {
+                    if !self.signed_in {
+                        ServerResponse::Error {
+                            message: "请先登录".to_string(),
                         }
-
-                        // 解锁客户端并开始处理后续消息
-                        drop(client);
-                        handle_authenticated_client(client_arc, pool, clients).await?;
                     } else {
-                        let response = ServerResponse::AuthResponse {
-                            status: "error".to_string(),
-                            message: "密码错误".to_string(),
-                        };
-                        send_packet(&mut *client.socket.lock().await, &serde_json::to_value(response)?).await?;
-                        return Ok(());
+                        self.handle_send_message(self.user_id.clone(), receiver, message).await
                     }
-                } else {
-                    let response = ServerResponse::AuthResponse {
-                        status: "error".to_string(),
-                        message: "用户不存在".to_string(),
-                    };
-                    send_packet(&mut *client.socket.lock().await, &serde_json::to_value(response)?).await?;
-                    return Ok(());
                 }
-            },
-            ClientRequest::SendMessage { .. } => {
-                // 未登录时尝试发送消息
-                let response = ServerResponse::Error {
-                    message: "请先登录".to_string(),
-                };
-                send_packet(&mut *client.socket.lock().await, &serde_json::to_value(response)?).await?;
-                return Ok(());
-            },
+            };
+
+            // 尝试发送响应
+            if let Err(e) = self.send_packet(&response).await {
+                // 检测到发送失败（例如连接断开）
+                eprintln!("发送数据失败，连接可能断开: {:?}", e);
+
+                // 调用 Api.down 方法处理账号下线逻辑
+                let mut api = self.api.lock().await;
+                api.down(&self.user_id).await;
+
+                break; // 跳出循环，停止处理客户端
+            }
         }
 
         Ok(())
+    }
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        println!("客户端对象销毁: {}", self.user_id);
+        // 这里可以执行更多清理逻辑，例如从全局状态中移除客户端
     }
 }

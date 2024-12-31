@@ -40,7 +40,8 @@ impl Api {
             Ok(valid) => {
                 if valid {
                     // 将客户端引用存入 clients 中
-                    &self.clients.insert(row.id.to_string(), client);
+                    // &self.clients.insert(row.id.to_string(), client);
+                    &self.clients.insert(username.to_string(), client);
                 }
                 Ok(valid)
             }
@@ -63,6 +64,21 @@ impl Api {
         println!("用户 {} 下线", user_id);
     }
     pub async fn send_message(&self, sender: &str, receiver: &str, message: &str) -> bool {
-        false
+        // 查找目标客户端
+        // for (key, value) in &self.clients {
+        //     println!("Key: {}", key);
+        // }
+        if let Some(client) = self.clients.get(receiver) {
+            let mut client = client.lock().await;
+            // 调用目标客户端的 receive_message 方法发送消息
+            client
+                .receive_message(sender.to_string(), message.to_string())
+                .await;
+            true
+        } else {
+            // 如果未找到目标客户端
+            println!("接收者 {} 不在线或不存在", receiver);
+            false
+        }
     }
 }

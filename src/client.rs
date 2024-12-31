@@ -1,5 +1,6 @@
 // src/client.rs
 use tokio::net::TcpStream;
+use tokio::signal;
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
 use std::collections::HashMap;
@@ -11,28 +12,31 @@ use crate::api::Api;
 #[derive(Clone)]
 pub struct Client {
     api: Arc<Mutex<Api>>,
-    user_id: String,
+    user_id: Arc<Mutex<String>>,
     writer: Arc<Mutex<tokio::io::BufWriter<tokio::net::tcp::OwnedWriteHalf>>>,
     reader: Arc<Mutex<tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>>>,
-    signed_in: bool,
+    signed_in: Arc<Mutex<bool>>,
 }
 
 impl Client {
     pub fn new(
         socket: TcpStream,
         api: Arc<Mutex<Api>>,
+        user_id: Arc<Mutex<String>>,
+        signed_in: Arc<Mutex<bool>>,
     ) -> Self {
         let (reader, writer) = socket.into_split();
         Self {
             api,
-            user_id: String::new(),
+            user_id,
             writer: Arc::new(Mutex::new(tokio::io::BufWriter::new(writer))),
             reader: Arc::new(Mutex::new(tokio::io::BufReader::new(reader))),
-            signed_in: false,
+            signed_in,
         }
     }
-    pub fn user_id(&self) -> String {
-        self.user_id.clone()
+    pub async fn user_id(&self) -> String {
+        let mut user_id = self.user_id.lock().await;
+        user_id.clone()
     }
     pub async fn send_packet(&mut self, msg: &ServerResponse) -> Result<()> {
         writer_packet(&mut self.writer, &msg).await
@@ -40,6 +44,16 @@ impl Client {
     pub async fn recv_packet(&mut self) -> Result<ClientRequest> {
         reader_packet(&mut self.reader).await
     }
+    pub async fn receive_message(&mut self, sender: String, message: String) {
+        let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let response = ServerResponse::ReceiveMessage {
+            sender,
+            message,
+            timestamp,
+        };
+        self.send_packet(&response).await.unwrap();
+    }
+
     async fn handle_register(&self, username: String, password: String) -> ServerResponse {
         let status = {
             let mut api = self.api.lock().await;
@@ -75,8 +89,10 @@ impl Client {
         match status {
             Ok(true) => {
                 // 登录成功，更新用户状态
-                self.user_id = username.clone();
-                self.signed_in = true;
+                let mut user_id = self.user_id.lock().await;
+                let mut signed_in = self.signed_in.lock().await;
+                *user_id = username.clone();
+                *signed_in = true;
     
                 ServerResponse::AuthResponse {
                     status: "success".to_string(),
@@ -124,7 +140,8 @@ impl Client {
                     eprintln!("客户端连接断开，错误: {:?}", e);
                     // 调用 Api.down 方法处理账号下线逻辑
                     let mut api = self.api.lock().await;
-                    api.down(&self.user_id).await;
+                    let mut user_id = self.user_id.lock().await;
+                    api.down(&user_id).await;
                     break; // 跳出循环，停止处理客户端
                 }
             };
@@ -137,12 +154,14 @@ impl Client {
                     self.handle_login(username, password).await
                 }
                 ClientRequest::SendMessage { receiver, message } => {
-                    if !self.signed_in {
+                    let signed_in = self.signed_in.lock().await;
+                    if !*signed_in {
                         ServerResponse::Error {
                             message: "请先登录".to_string(),
                         }
                     } else {
-                        self.handle_send_message(self.user_id.clone(), receiver, message).await
+                        let user_id = self.user_id().await;
+                        self.handle_send_message(user_id, receiver, message).await
                     }
                 }
             };
@@ -154,7 +173,8 @@ impl Client {
 
                 // 调用 Api.down 方法处理账号下线逻辑
                 let mut api = self.api.lock().await;
-                api.down(&self.user_id).await;
+                let user_id = self.user_id().await;
+                api.down(&user_id).await;
 
                 break; // 跳出循环，停止处理客户端
             }
@@ -166,7 +186,7 @@ impl Client {
 
 impl Drop for Client {
     fn drop(&mut self) {
-        println!("客户端对象销毁: {}", self.user_id);
+        println!("客户端对象销毁");
         // 这里可以执行更多清理逻辑，例如从全局状态中移除客户端
     }
 }

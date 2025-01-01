@@ -153,7 +153,7 @@ impl Client {
                     // 检测到连接断开
                     eprintln!("客户端连接断开，错误: {:?}", e);
                     // 调用 Api.down 方法处理账号下线逻辑
-                    let api = self.api.lock().await;
+                    let mut api = self.api.lock().await;
                     let user_id = self.user_id.lock().await;
                     api.down(&user_id).await;
                     break; // 跳出循环，停止处理客户端
@@ -192,7 +192,7 @@ impl Client {
                 eprintln!("发送数据失败，连接可能断开: {:?}", e);
 
                 // 调用 Api.down 方法处理账号下线逻辑
-                let api = self.api.lock().await;
+                let mut api = self.api.lock().await;
                 let user_id = self.user_id().await;
                 api.down(&user_id).await;
 

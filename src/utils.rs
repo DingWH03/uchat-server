@@ -11,7 +11,7 @@ pub async fn writer_packet(writer: &mut Arc<Mutex<tokio::io::BufWriter<tokio::ne
     let mut writer = writer.lock().await;
     // 将 ServerResponse 枚举序列化为 JSON 字符串
     let json = serde_json::to_string(msg)?;
-    // println!("发送消息: {}", json);
+    println!("发送消息: {}", json);
     
     // 将序列化后的数据长度写入流中（以便接收方知道数据大小）
     let length = json.len() as u32;
@@ -36,7 +36,7 @@ pub async fn reader_packet(reader: &mut Arc<Mutex<tokio::io::BufReader<tokio::ne
     // 根据数据长度读取 JSON 数据
     let mut json_buf = vec![0u8; length];
     reader.read_exact(&mut json_buf).await?;
-    // println!("接收消息: {}", String::from_utf8(json_buf.clone())?);
+    println!("接收消息: {}", String::from_utf8(json_buf.clone())?);
     
     // 将读取到的 JSON 数据反序列化为 ClientRequest 枚举
     let request = serde_json::from_slice(&json_buf)?;

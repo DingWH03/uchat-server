@@ -70,8 +70,9 @@ impl Api {
             Err(_) => Ok(false),
         }
     }
-    pub async fn down(&self, user_id: &str) {
+    pub async fn down(&mut self, user_id: &str) {
         println!("用户 {} 下线", user_id);
+        self.clients.remove(user_id);
     }
     pub async fn send_message(&self, sender: &str, receiver: &str, message: &str) -> bool {
         if receiver == "all" {

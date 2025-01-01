@@ -1,9 +1,7 @@
 // src/client.rs
 use tokio::net::TcpStream;
-use tokio::signal;
 use std::sync::Arc;
-use tokio::sync::{Mutex, mpsc};
-use std::collections::HashMap;
+use tokio::sync::Mutex;
 use anyhow::Result;
 use crate::protocol::{ClientRequest, ServerResponse};
 use crate::utils::{reader_packet, writer_packet};
@@ -35,7 +33,7 @@ impl Client {
         }
     }
     pub async fn user_id(&self) -> String {
-        let mut user_id = self.user_id.lock().await;
+        let user_id = self.user_id.lock().await;
         user_id.clone()
     }
     pub async fn send_packet(&mut self, msg: &ServerResponse) -> Result<()> {
@@ -56,7 +54,7 @@ impl Client {
 
     async fn handle_register(&self, username: String, password: String) -> ServerResponse {
         let status = {
-            let mut api = self.api.lock().await;
+            let api = self.api.lock().await;
             api.register(&username, &password).await
         };
     
@@ -121,7 +119,7 @@ impl Client {
         message: String,
     ) -> ServerResponse {
         let status = {
-            let mut api = self.api.lock().await;
+            let api = self.api.lock().await;
             api.send_message(&sender, &receiver, &message).await
         };
 
@@ -129,6 +127,22 @@ impl Client {
             status: if status { "ok".to_string() } else { "error".to_string() },
             message: if status { "消息发送成功".to_string() } else { "用户不存在".to_string() },
         }
+    }
+
+    async fn get_online_users(&self) -> ServerResponse {
+        let api = self.api.lock().await;
+        let online_users = api.online_users().await;
+        ServerResponse::OnlineUsers {
+            flag: "ok".to_string(),
+            user_ids: online_users,
+        }
+    }
+
+    pub async fn send_error(&mut self, message: &str) {
+        let response = ServerResponse::Error {
+            message: message.to_string(),
+        };
+        self.send_packet(&response).await.unwrap();
     }
 
     pub async fn run(&mut self) -> Result<()> {
@@ -139,20 +153,14 @@ impl Client {
                     // 检测到连接断开
                     eprintln!("客户端连接断开，错误: {:?}", e);
                     // 调用 Api.down 方法处理账号下线逻辑
-                    let mut api = self.api.lock().await;
-                    let mut user_id = self.user_id.lock().await;
+                    let api = self.api.lock().await;
+                    let user_id = self.user_id.lock().await;
                     api.down(&user_id).await;
                     break; // 跳出循环，停止处理客户端
                 }
             };
 
             let response = match request {
-                ClientRequest::Register { username, password } => {
-                    self.handle_register(username, password).await
-                }
-                ClientRequest::Login { username, password } => {
-                    self.handle_login(username, password).await
-                }
                 ClientRequest::SendMessage { receiver, message } => {
                     let signed_in = self.signed_in.lock().await;
                     if !*signed_in {
@@ -164,6 +172,18 @@ impl Client {
                         self.handle_send_message(user_id, receiver, message).await
                     }
                 }
+                ClientRequest::Request { request } => match request.as_str() {
+                    "online_users" => self.get_online_users().await,
+                    _ => ServerResponse::Error {
+                        message: "未知请求".to_string(),
+                    },
+                },
+                ClientRequest::Register { username, password } => {
+                    self.handle_register(username, password).await
+                }
+                ClientRequest::Login { username, password } => {
+                    self.handle_login(username, password).await
+                }
             };
 
             // 尝试发送响应
@@ -172,7 +192,7 @@ impl Client {
                 eprintln!("发送数据失败，连接可能断开: {:?}", e);
 
                 // 调用 Api.down 方法处理账号下线逻辑
-                let mut api = self.api.lock().await;
+                let api = self.api.lock().await;
                 let user_id = self.user_id().await;
                 api.down(&user_id).await;
 

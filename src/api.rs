@@ -1,9 +1,9 @@
-use crate::client::{self, Client};
+use crate::client::{Client};
 use bcrypt::hash;
+use bcrypt::BcryptError;
 use sqlx::mysql::MySqlPool;
-use tokio::sync::Mutex;
 use std::{collections::HashMap, sync::Arc};
-use bcrypt::{verify, BcryptError}; // 引入 bcrypt 库
+use tokio::sync::Mutex; // 引入 bcrypt 库
 
 pub struct Api {
     pool: MySqlPool,
@@ -11,7 +11,10 @@ pub struct Api {
 }
 
 impl Api {
-    pub fn new(pool: sqlx::Pool<sqlx::MySql>, clients: HashMap<String, Arc<Mutex<Client>>>) -> Self {
+    pub fn new(
+        pool: sqlx::Pool<sqlx::MySql>,
+        clients: HashMap<String, Arc<Mutex<Client>>>,
+    ) -> Self {
         Self { pool, clients }
     }
     pub async fn login(
@@ -39,9 +42,16 @@ impl Api {
         match bcrypt::verify(password, &password_hash) {
             Ok(valid) => {
                 if valid {
-                    // 将客户端引用存入 clients 中
-                    // &self.clients.insert(row.id.to_string(), client);
-                    &self.clients.insert(username.to_string(), client);
+                    if let Some(client) = self.clients.get(username) {
+                        let mut client = client.lock().await;
+                        client.send_error("用户重复登录").await;
+                        return Ok(false);
+                    } else {
+                        // 将客户端引用存入 clients 中
+                        // &self.clients.insert(row.id.to_string(), client);
+                        let _ = &self.clients.insert(username.to_string(), client);
+                        return Ok(true);
+                    }
                 }
                 Ok(valid)
             }
@@ -64,21 +74,49 @@ impl Api {
         println!("用户 {} 下线", user_id);
     }
     pub async fn send_message(&self, sender: &str, receiver: &str, message: &str) -> bool {
-        // 查找目标客户端
-        // for (key, value) in &self.clients {
-        //     println!("Key: {}", key);
-        // }
-        if let Some(client) = self.clients.get(receiver) {
-            let mut client = client.lock().await;
-            // 调用目标客户端的 receive_message 方法发送消息
-            client
-                .receive_message(sender.to_string(), message.to_string())
-                .await;
+        if receiver == "all" {
+            // 创建一个异步任务集合
+            let clients = self.clients.clone(); // 克隆 Arc 引用
+
+            // 创建一个异步任务集合
+            let tasks: Vec<_> = clients
+                .iter()
+                .map(|(client_id, client)| {
+                    let sender = sender.to_string();
+                    let message = message.to_string();
+                    let _client_id = client_id.clone(); // 克隆 client_id
+                    let client = client.clone(); // 克隆锁
+
+                    tokio::spawn(async move {
+                        let mut client = client.lock().await;
+                        client.receive_message(sender, message).await;
+                    })
+                })
+                .collect();
+
+            // 等待所有任务完成
+            for task in tasks {
+                if let Err(err) = task.await {
+                    println!("并发任务失败: {}", err);
+                }
+            }
             true
         } else {
-            // 如果未找到目标客户端
-            println!("接收者 {} 不在线或不存在", receiver);
-            false
+            // 单个接收者处理逻辑
+            if let Some(client) = self.clients.get(receiver) {
+                let mut client = client.lock().await;
+                client
+                    .receive_message(sender.to_string(), message.to_string())
+                    .await;
+                true
+            } else {
+                println!("接收者 {} 不在线或不存在", receiver);
+                false
+            }
         }
+    }
+
+    pub async fn online_users(&self) -> Vec<String> {
+        self.clients.keys().cloned().collect()
     }
 }

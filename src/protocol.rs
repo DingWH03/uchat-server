@@ -4,6 +4,10 @@ use serde::{Serialize, Deserialize};
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "action")]
 pub enum ClientRequest {
+    #[serde(rename = "request")]
+    Request {
+        request: String,
+    },
     #[serde(rename = "register")]
     Register {
         username: String,
@@ -38,5 +42,10 @@ pub enum ServerResponse {
     #[serde(rename = "error")]
     Error {
         message: String,
+    },
+    #[serde(rename = "online_users")]
+    OnlineUsers {
+        flag: String,
+        user_ids: Vec<String>,
     },
 }
